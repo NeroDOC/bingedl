@@ -76,6 +76,8 @@ eq "series audio" "ukr,eng" "$(langs "$E1")"
 eq "no .part left" "" "$(find "$OUT" -name '*.part')"
 [ "$RC" -eq 0 ] || printf '%s\n' "$LOG"
 
+eq "state saved" "My Show|2|3" "$(sed -n 's/^LAST_TITLE="\(.*\)"/\1/p;s/^LAST_SEASON="\(.*\)"/\1/p;s/^LAST_EP="\(.*\)"/\1/p' "$XDG_CONFIG_HOME/bingedl/state" | paste -sd'|' -)"
+
 # 2. rerun: existing files are skipped
 run -s -n "My Show" -S 2 -a all "$URL/master.m3u8" "$URL/master.m3u8"
 eq "rerun rc" 0 "$RC"
@@ -92,7 +94,14 @@ eq "movie audio" "eng" "$(langs "$M")"
 # 4. 404 fails with a clear reason and non-zero exit
 run -m -n "Missing" "$URL/nope.m3u8"
 eq "404 rc" 1 "$RC"
+eq "404 retry file" yes "$(grep -q 'nope.m3u8' "$XDG_CONFIG_HOME/bingedl/last-failed.txt" && echo yes || echo no)"
 eq "404 reason" yes "$(printf '%s' "$LOG" | grep -q 'HTTP 404' && echo yes || echo no)"
+
+# 4b. parallel downloads (-j 2), and a successful run clears the retry file
+run -s -n "Par" -j 2 "$URL/master.m3u8" "$URL/master.m3u8"
+eq "parallel rc" 0 "$RC"
+eq "parallel files" 2 "$(find "$OUT/Par" -name '*.mp4' | wc -l | tr -d ' ')"
+eq "retry file cleared" no "$([ -e "$XDG_CONFIG_HOME/bingedl/last-failed.txt" ] && echo yes || echo no)"
 
 # 5. DRM is detected and reported
 run -m -n "Locked" "$URL/drm.m3u8"

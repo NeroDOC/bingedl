@@ -111,5 +111,42 @@ eq "header text"   "bingedl v9.9.9|saved." "$(header | paste -sd'|' -)"
 eq "header status once" "bingedl v9.9.9" "$(STATUS=""; header)"
 eq "header no escape" "0" "$(STATUS=""; header | grep -c "$(printf '\033')")"
 
+# --- remembered series, retry file
+T=$(mktemp -d); CONFIG_DIR="$T/c"; STATE_FILE="$T/c/state"; FAILED_FILE="$T/c/last-failed.txt"
+save_state 'My "Show"' 2 7; load_state
+eq "state title"  "My Show" "$LAST_TITLE"
+eq "state season" "2" "$LAST_SEASON"
+eq "state ep"     "7" "$LAST_EP"
+WORK="$T/w"; mkdir -p "$WORK"; QUEUE="$T/q"; MODE=series; TITLE=Foo
+printf '1\t1\tu1\n1\t2\tu2\n' >"$QUEUE"
+printf 'ok\t1\ta\t-\n' >"$WORK/results"; remember_series; load_state
+eq "remember next" "Foo|1|3" "$LAST_TITLE|$LAST_SEASON|$LAST_EP"
+printf 'fail\t1\ta\tx\n' >"$WORK/results"; save_state Bar 1 1; remember_series; load_state
+eq "remember none" "Bar|1|1" "$LAST_TITLE|$LAST_SEASON|$LAST_EP"
+printf '2\t5\tuB\n1\t3\tuA\n' >"$WORK/failed"; write_retry >/dev/null
+eq "retry series" "# bingedl: links that failed in the last run|@season 1|@start 3|uA|@season 2|@start 5|uB" "$(paste -sd'|' - <"$FAILED_FILE")"
+MODE=movie; printf '1\t1\tuM\n' >"$WORK/failed"; write_retry >/dev/null
+eq "retry movie"  "# bingedl: links that failed in the last run|uM" "$(paste -sd'|' - <"$FAILED_FILE")"
+: >"$WORK/failed"; write_retry
+eq "retry removed" "no" "$([ -e "$FAILED_FILE" ] && echo yes || echo no)"
+rm -rf "$T"
+
+# --- main menu status panel
+MOVIES_DIR=/home/test/M; SERIES_DIR=/other/S; MAX_HEIGHT=720; AUDIO=uk; FFV=9.9
+eq "panel movies"  "1" "$(status_panel | grep -c 'Movies .* ~/M$')"
+eq "panel series"  "1" "$(status_panel | grep -c 'Series .* /other/S$')"
+eq "panel quality" "1" "$(status_panel | grep -c 'Quality .* 720, audio: uk$')"
+eq "panel ffmpeg"  "1" "$(status_panel | grep -c 'ffmpeg .* 9.9$')"
+FFV=missing
+eq "panel missing" "1" "$(status_panel | grep -c 'not found')"
+
+# --- about
+AUTHOR="A B"; REPO_URL="https://x.example/r"; LINKEDIN_URL=""
+eq "about repo"       "1" "$(about | grep -c 'https://x.example/r/issues')"
+eq "about no linkedin" "0" "$(about | grep -c LinkedIn)"
+eq "about share"      "1" "$(about | grep -c 'named and numbered: bingedl https://x.example/r')"
+LINKEDIN_URL="https://www.linkedin.com/in/x"
+eq "about linkedin"   "1" "$(about | grep -c 'linkedin.com/in/x')"
+
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

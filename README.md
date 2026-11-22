@@ -30,7 +30,8 @@ links in, a correctly named season out*.
 - **Audio track picker:** default, all, ask, or by language (`-a uk,en`).
 - **Safe by design:** downloads to `*.part`, verifies duration, then renames; existing files are skipped.
 - **Retries** on network errors; no pointless retries on 403/404.
-- **Progress bar, parallel downloads, desktop notifications** (per file / season / everything).
+- **Picks up where you left off:** the menu remembers your last series and the next episode; links that failed are saved to `~/.config/bingedl/last-failed.txt`, ready to re-run with `-f`.
+- **Progress bar (one combined status line with `-j`), parallel downloads, desktop notifications** (per file / season / everything).
 - **Interactive menu and full CLI**, settings saved to `~/.config/bingedl/config`.
 - Streams are copied, never re-encoded: fast and lossless.
 
@@ -81,6 +82,7 @@ https://example.com/s2e5/master.m3u8
 | `-o DIR` | output folder for this run |
 | `-j N`, `-r N` | parallel downloads, retries |
 | `--overwrite`, `--dry-run`, `--no-progress`, `--settings` | |
+| `--about` | author, links and version/OS/ffmpeg info to paste into bug reports |
 
 ## Settings
 

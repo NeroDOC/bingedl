@@ -7,9 +7,14 @@
 # reported, never downloaded.
 
 VERSION="1.0.0"
+AUTHOR="Dmytro Pavlovskyi"
+REPO_URL="https://github.com/NeroDOC/bingedl"
+LINKEDIN_URL="https://www.linkedin.com/in/nerodoc/"   # About hides the row when empty
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/bingedl"
 CONFIG_FILE="$CONFIG_DIR/config"
+STATE_FILE="$CONFIG_DIR/state"            # last series / next episode
+FAILED_FILE="$CONFIG_DIR/last-failed.txt" # links that failed in the last run
 CONFIG_KEYS="MOVIES_DIR SERIES_DIR MAX_HEIGHT AUDIO RETRIES JOBS LAYOUT SPACES NOTIFY_FILE NOTIFY_SEASON NOTIFY_DONE FFMPEG"
 
 # ---------------------------------------------------------------- basics ----
@@ -92,6 +97,53 @@ save_config() {
     echo "# bingedl config - change with: bingedl --settings"
     for k in $CONFIG_KEYS; do printf '%s="%s"\n' "$k" "${!k}"; done
   } >"$CONFIG_FILE"
+}
+
+load_state() {
+  local k v
+  LAST_TITLE=""; LAST_SEASON=""; LAST_EP=""
+  [ -f "$STATE_FILE" ] || return 0
+  while IFS='=' read -r k v; do
+    v=${v%\"}; v=${v#\"}
+    case $k in
+      LAST_TITLE)  LAST_TITLE=$v;;
+      LAST_SEASON) is_uint "$v" && LAST_SEASON=$v;;
+      LAST_EP)     is_uint "$v" && LAST_EP=$v;;
+    esac
+  done <"$STATE_FILE"
+  return 0
+}
+
+save_state() { # title season next_episode
+  mkdir -p "$CONFIG_DIR" || return 0
+  printf 'LAST_TITLE="%s"\nLAST_SEASON="%s"\nLAST_EP="%s"\n' "$(printf '%s' "$1" | tr -d '"\n')" "$2" "$3" >"$STATE_FILE"
+}
+
+# After a series run with at least one success: the next run starts after the last queued episode.
+remember_series() {
+  local last
+  [ "$MODE" = series ] || return 0
+  awk -F'\t' '$1 == "ok"' "$WORK/results" | grep -q . || return 0
+  last=$(tail -1 "$QUEUE")
+  save_state "$TITLE" "$(printf '%s' "$last" | cut -f1)" "$(( $(printf '%s' "$last" | cut -f2) + 1 ))"
+}
+
+record_failed() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"$WORK/failed"; } # season ep url
+
+# Failed links as a list file the user can feed back with -f (keeps their season/episode numbers).
+write_retry() {
+  local s e u
+  if [ ! -s "$WORK/failed" ]; then rm -f "$FAILED_FILE"; return 0; fi
+  mkdir -p "$CONFIG_DIR" || return 0
+  {
+    echo "# bingedl: links that failed in the last run"
+    sort -t "$(printf '\t')" -k1,1n -k2,2n "$WORK/failed" | while IFS=$'\t' read -r s e u; do
+      if [ "$MODE" = series ]; then printf '@season %s\n@start %s\n' "$s" "$e"; fi
+      printf '%s\n' "$u"
+    done
+  } >"$FAILED_FILE"
+  info "Failed links saved to $(short "$FAILED_FILE")"
+  info "  retry: bingedl $([ "$MODE" = series ] && echo -s || echo -m) -n \"$TITLE\" -f \"$(short "$FAILED_FILE")\""
 }
 
 # Validate and set one setting. Returns 1 (with a warning) on bad input.
@@ -457,10 +509,53 @@ draw_bar() { # label duration  (reads ffmpeg -progress output on stdin)
   printf '\r\033[K'
 }
 
+# Parallel mode: write each job's percentage to $WORK/prog/<label> for draw_jobs.
+job_progress() { # label duration  (reads ffmpeg -progress output on stdin)
+  local line us=0 v f
+  f="$WORK/prog/$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"
+  while IFS= read -r line; do
+    case $line in
+      out_time_us=*) v=${line#*=}; if is_uint "$v"; then us=$v; fi;;
+      progress=*)
+        awk -v us="$us" -v dur="$2" -v label="$1" 'BEGIN {
+          p = (dur > 0) ? us / 1e6 / dur * 100 : 0; if (p > 100) p = 100
+          printf "%s\t%d\n", label, p }' >"$f.tmp" && mv -f "$f.tmp" "$f";;
+    esac
+  done
+  rm -f "$f" "$f.tmp"
+}
+
+# One status line with all running downloads, e.g.  Ep01 [████░░░░] 50%   Ep02 [██░░░░░░] 25%
+draw_jobs() {
+  local f l p cols n i bar out=""
+  [ "${SHOW_JOBS:-0}" -eq 1 ] || return 0
+  cols=$(tput cols 2>/dev/null); is_uint "$cols" || cols=80
+  for f in "$WORK"/prog/*; do
+    [ -f "$f" ] || continue
+    IFS=$'\t' read -r l p <"$f"
+    is_uint "$p" || continue
+    n=$((p * 8 / 100)); bar=""
+    for ((i = 0; i < 8; i++)); do if [ "$i" -lt "$n" ]; then bar="$bar$G_ON"; else bar="$bar$G_OFF"; fi; done
+    out="$out${l%.mp4} [$bar] $p%   "
+  done
+  [ -n "$out" ] || return 0
+  printf '\r\033[K%s' "${out:0:$((cols - 1))}"
+}
+
+wait_jobs() {
+  while [ "$(jobs -rp | wc -l | tr -d ' ')" -gt 0 ]; do draw_jobs; sleep 0.5; done
+  wait
+  if [ "${SHOW_JOBS:-0}" -eq 1 ]; then printf '\r\033[K'; fi
+  return 0
+}
+
 run_ffmpeg() { # label errlog
   local rc
   if [ "$SHOW_BAR" -eq 1 ]; then
     "${CMD[@]}" 2>"$2" | draw_bar "$1" "$P_DUR"
+    rc=${PIPESTATUS[0]}
+  elif [ "$SHOW_JOBS" -eq 1 ]; then
+    "${CMD[@]}" 2>"$2" | job_progress "$1" "$P_DUR"
     rc=${PIPESTATUS[0]}
   else
     "${CMD[@]}" >/dev/null 2>"$2"
@@ -517,6 +612,7 @@ notify() { # title message
 # status season label detail
 finish_file() {
   local st=$1 season=$2 label=$3 detail=$4
+  [ "${SHOW_JOBS:-0}" -eq 1 ] && printf '\r\033[K'
   printf '%s\t%s\t%s\t%s\n' "$st" "$season" "$label" "${detail:--}" >>"$WORK/results"
   case $st in
     ok)   printf '  %s✓%s %s %s(%s)%s\n' "$C_GRN" "$C_OFF" "$label" "$C_DIM" "$detail" "$C_OFF";;
@@ -534,10 +630,10 @@ finish_file() {
   return 0
 }
 
-download_item() { # out label season
-  local out=$1 label=$2 season=$3 part errlog attempt=1 max rc got start size
+download_item() { # out label season ep url
+  local out=$1 label=$2 season=$3 ep=$4 url=$5 part errlog attempt=1 max rc got start size
   part="$out.part"
-  if ! mkdir -p "$(dirname "$out")"; then finish_file fail "$season" "$label" "cannot create folder"; return 1; fi
+  if ! mkdir -p "$(dirname "$out")"; then finish_file fail "$season" "$label" "cannot create folder"; record_failed "$season" "$ep" "$url"; return 1; fi
   echo "$part" >>"$WORK/parts"
   errlog=$(mktemp "$WORK/err.XXXXXX")
   max=$(( $(eff_retries) + 1 ))
@@ -564,6 +660,7 @@ download_item() { # out label season
     if [ "$fatal" -eq 1 ] || [ "$attempt" -ge "$max" ]; then
       rm -f "$part" "$errlog"
       finish_file fail "$season" "$label" "$reason"
+      record_failed "$season" "$ep" "$url"
       return 1
     fi
     attempt=$((attempt + 1))
@@ -660,7 +757,7 @@ confirm() { local a; read -r -p "$1 [Y/n] " a || return 1; case $a in n|N|no|NO)
 
 finish_season() { # season
   local s=$1 ok fail skip msg
-  [ "$NJ" -gt 1 ] && wait
+  [ "$NJ" -gt 1 ] && wait_jobs
   ok=$(awk -F'\t' -v s="$s" '$1 == "ok"   && $2 == s' "$WORK/results" | wc -l | tr -d ' ')
   fail=$(awk -F'\t' -v s="$s" '$1 == "fail" && $2 == s' "$WORK/results" | wc -l | tr -d ' ')
   skip=$(awk -F'\t' -v s="$s" '$1 == "skip" && $2 == s' "$WORK/results" | wc -l | tr -d ' ')
@@ -683,7 +780,10 @@ print_summary() {
   printf '%sSummary:%s %s%s downloaded%s, %s skipped, %s%s failed%s\n' "$C_BLD" "$C_OFF" "$C_GRN" "$ok" "$C_OFF" "$skip" "$fc" "$fail" "$C_OFF"
   if [ "$fail" -gt 0 ]; then
     awk -F'\t' '$1 == "fail" { printf "  ✗ %s: %s\n", $3, $4 }' "$WORK/results"
+    write_retry
     RC=1
+  else
+    rm -f "$FAILED_FILE"
   fi
   if [ "$MODE" = series ] && [ "$NOTIFY_DONE" = on ] && [ "$nseasons" -gt 1 ]; then
     notify "$TITLE" "All done: $ok downloaded, $skip skipped, $fail failed"
@@ -696,10 +796,12 @@ run_queue() {
   [ "$MODE" = movie ] && NJ=1
   nj=$NJ
   total=$(wc -l <"$QUEUE" | tr -d ' ')
-  SHOW_BAR=0
-  if [ "$nj" -eq 1 ] && [ -t 1 ] && [ "$NO_PROGRESS" -eq 0 ]; then SHOW_BAR=1; fi
+  SHOW_BAR=0; SHOW_JOBS=0
+  if [ -t 1 ] && [ "$NO_PROGRESS" -eq 0 ]; then
+    if [ "$nj" -eq 1 ]; then SHOW_BAR=1; else SHOW_JOBS=1; fi
+  fi
   HEIGHT_MEMO=""; AUDIO_MEMO=""
-  : >"$WORK/results"; : >"$WORK/parts"
+  : >"$WORK/results"; : >"$WORK/parts"; : >"$WORK/failed"; mkdir -p "$WORK/prog"
   RC=0
 
   while IFS=$'\t' read -r season ep url <&3; do
@@ -713,11 +815,11 @@ run_queue() {
       continue
     fi
     if [ "$nj" -gt 1 ]; then
-      while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "$nj" ]; do sleep 1; done
+      while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "$nj" ]; do draw_jobs; sleep 0.5; done
     fi
 
     info "[$idx/$total] $label"
-    if ! prepare "$url"; then finish_file fail "$season" "$label" "$ERR"; continue; fi
+    if ! prepare "$url"; then finish_file fail "$season" "$label" "$ERR"; record_failed "$season" "$ep" "$url"; continue; fi
     info_line="      "
     [ "$P_HEIGHT" != 0 ] && info_line="${info_line}${P_HEIGHT}p  "
     if [ "${#P_ANAMES[@]}" -gt 0 ]; then
@@ -727,14 +829,15 @@ run_queue() {
     [ "$info_line" != "      " ] && printf '%s%s%s\n' "$C_DIM" "$info_line" "$C_OFF"
 
     if [ "$nj" -gt 1 ]; then
-      download_item "$out" "$label" "$season" &
+      download_item "$out" "$label" "$season" "$ep" "$url" &
     else
-      download_item "$out" "$label" "$season"
+      download_item "$out" "$label" "$season" "$ep" "$url"
     fi
   done 3<"$QUEUE"
 
   [ -n "$prev" ] && finish_season "$prev"
-  wait
+  wait_jobs
+  remember_series
   print_summary
 }
 
@@ -770,6 +873,48 @@ menu_item() { printf '  %s[%s]%s %s\n' "$C_CYN" "$1" "$C_OFF" "$2"; }           
 heading()   { printf '\n  %s%s%s\n' "$C_BLD" "$1" "$C_OFF"; }
 srow()      { printf '    %s%-4s%s %-22s %s%s%s  %s%s%s\n' "$C_CYN" "[$1]" "$C_OFF" "$2" "$C_BLD" "$3" "$C_OFF" "$C_DIM" "${4:-}" "$C_OFF"; } # key label value hint
 
+ffmpeg_line() {
+  if find_ffmpeg; then "$FFMPEG_BIN" -hide_banner -version 2>/dev/null | head -1 | cut -d' ' -f1-3
+  else echo "not found"; fi
+}
+
+arow() { printf '  %s%-12s%s %s\n' "$C_DIM" "$1" "$C_OFF" "$2"; } # label value
+
+short() { printf '%s' "${1/#$HOME/~}"; }
+
+# Folders, quality/audio and ffmpeg status shown under the main menu.
+status_panel() {
+  [ -n "${FFV:-}" ] || FFV=$(if find_ffmpeg; then "$FFMPEG_BIN" -hide_banner -version 2>/dev/null | head -1 | awk '{print $3}'; else echo missing; fi)
+  echo
+  arow Movies "$(short "$MOVIES_DIR")"
+  arow Series "$(short "$SERIES_DIR")"
+  arow Quality "$MAX_HEIGHT, audio: $AUDIO"
+  if [ "$FFV" = missing ]; then
+    arow ffmpeg "${C_RED}✗ not found${C_OFF} - install it or set its path in Settings"
+  else
+    arow ffmpeg "${C_GRN}✓${C_OFF} $FFV"
+  fi
+}
+
+about() {
+  header
+  printf '\n  %sAbout%s\n  Download whole seasons from HLS (m3u8) streams: named, numbered, organized.\n\n' "$C_BLD" "$C_OFF"
+  arow Author "$AUTHOR"
+  arow GitHub "$REPO_URL"
+  [ -n "$LINKEDIN_URL" ] && arow LinkedIn "$LINKEDIN_URL"
+  arow License "MIT"
+  printf '\n  %sLike it?%s Star the repo, report a bug or share an idea:\n' "$C_BLD" "$C_OFF"
+  arow Issues "$REPO_URL/issues"
+  arow Discussions "$REPO_URL/discussions"
+  printf '\n  %sShare%s\n  Season downloads from HLS streams, named and numbered: bingedl %s\n' "$C_BLD" "$C_OFF" "$REPO_URL"
+  printf '\n  %sFor bug reports%s\n' "$C_BLD" "$C_OFF"
+  arow bingedl "v$VERSION"
+  arow System "$(uname -srm)"
+  arow bash "$BASH_VERSION"
+  arow ffmpeg "$(ffmpeg_line)"
+  printf '\n  %sUse it only for content you have the right to download.\n  Not affiliated with any streaming service.%s\n' "$C_DIM" "$C_OFF"
+}
+
 # Keep output (results, warnings) on screen until a key is pressed, before the next clear.
 pause() { if [ -t 0 ]; then read -r -p "Press Enter to continue..." _; fi; return 0; }
 
@@ -792,16 +937,18 @@ interactive_movie() {
 }
 
 interactive_series() {
-  local s=${SEASON_OPT:-} e=${START_OPT:-} line
+  local s=${SEASON_OPT:-} e=${START_OPT:-} line ds=1 de=1
   header; info "Download a series / seasons"
   MODE=series; : >"$QUEUE"
   if [ -z "$TITLE" ]; then
-    read -r -p "Series name: " TITLE || return 0
+    read -r -p "Series name${LAST_TITLE:+ [$LAST_TITLE]}: " TITLE || return 0
     TITLE=$(trim "$TITLE")
+    [ -n "$TITLE" ] || TITLE=$LAST_TITLE
     [ -n "$TITLE" ] || return 0
   fi
-  if [ -z "$s" ]; then read -r -p "Season [1]: " s; s=${s:-1}; fi
-  if [ -z "$e" ]; then read -r -p "First episode [1]: " e; e=${e:-1}; fi
+  if [ "$TITLE" = "$LAST_TITLE" ] && [ -n "$LAST_SEASON" ]; then ds=$LAST_SEASON; de=${LAST_EP:-1}; fi
+  if [ -z "$s" ]; then read -r -p "Season [$ds]: " s; s=${s:-$ds}; fi
+  if [ -z "$e" ]; then read -r -p "First episode [$de]: " e; e=${e:-$de}; fi
   if ! is_uint "$s" || ! is_uint "$e"; then warn "season and episode must be numbers"; return 0; fi
   Q_SEASON=$((10#$s)); Q_EP=$((10#$e))
   info "Paste one link per line. Empty line = continue. Also: @season N, @start N, @file PATH"
@@ -881,17 +1028,22 @@ interactive() {
   local c
   while :; do
     header
-    echo
+    printf '%sHLS season downloader: named, numbered, organized%s\n\n' "$C_DIM" "$C_OFF"
     menu_item 1 "Download a movie"
     menu_item 2 "Download a series / seasons"
     menu_item 3 "Settings"
+    menu_item 4 "About"
     menu_item q "Quit"
-    read -r -p "> " c || return 0
+    status_panel
+    printf '\n'
+    read -r -n 1 -p "> " c || return 0   # a single key, no Enter needed
+    [ -n "$c" ] && echo
     case $c in
       1) interactive_movie; pause;;
       2) interactive_series; pause;;
-      3) settings_menu;;
-      q|Q|'') return 0;;
+      3) settings_menu; FFV=""; FFMPEG_BIN="";;
+      4) about; pause;;
+      q|Q) return 0;;
     esac
     TITLE=""; SEASON_OPT=""; START_OPT=""
   done
@@ -919,12 +1071,13 @@ Options:
   -q, --max-height N|auto|ask   highest quality to download (default: from config)
   -a, --audio auto|all|ask|uk,en   which audio tracks to keep
   -o, --output DIR         output folder (overrides the configured one)
-  -j, --jobs N|auto        parallel downloads (progress bar is off when N > 1)
+  -j, --jobs N|auto        parallel downloads (N > 1 shows one combined status line)
   -r, --retries N|auto     extra attempts per file
       --overwrite          re-download files that already exist
       --dry-run            show what would be downloaded and where, then exit
       --no-progress        plain output instead of a progress bar
       --settings           open the settings menu
+      --about              show author, links and diagnostic info for bug reports
   -h, --help               this help
   -V, --version
 
@@ -942,7 +1095,7 @@ EOF
 
 parse_args() {
   URLS=(); LISTS=(); MODE=""; TITLE=""; SEASON_OPT=""; START_OPT=""
-  OUTPUT_OVERRIDE=""; OVERWRITE=0; DRY_RUN=0; NO_PROGRESS=0; OPEN_SETTINGS=0
+  OUTPUT_OVERRIDE=""; OVERWRITE=0; DRY_RUN=0; NO_PROGRESS=0; OPEN_SETTINGS=0; OPEN_ABOUT=0
   while [ $# -gt 0 ]; do
     case $1 in
       -m|--movie)  MODE=movie;;
@@ -960,6 +1113,7 @@ parse_args() {
       --dry-run)     DRY_RUN=1;;
       --no-progress) NO_PROGRESS=1;;
       --settings)    OPEN_SETTINGS=1;;
+      --about)       OPEN_ABOUT=1;;
       -h|--help)     usage; exit 0;;
       -V|--version)  echo "bingedl $VERSION"; exit 0;;
       --)            shift; while [ $# -gt 0 ]; do URLS+=("$1"); shift; done; break;;
@@ -1007,13 +1161,14 @@ cleanup() {
 }
 
 main() {
-  init_colors; set_defaults; load_config
+  init_colors; set_defaults; load_config; load_state
   parse_args "$@"
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/bingedl.XXXXXX") || die "cannot create a temp dir"
-  QUEUE="$WORK/queue"; RC=0; NJ=1; SHOW_BAR=0; STATUS=""
+  QUEUE="$WORK/queue"; RC=0; NJ=1; SHOW_BAR=0; SHOW_JOBS=0; STATUS=""
   trap 'echo; echo "Interrupted."; cleanup; exit 130' INT TERM
   trap cleanup EXIT
 
+  if [ "$OPEN_ABOUT" -eq 1 ]; then NO_CLEAR=1 about; return 0; fi
   if [ "$OPEN_SETTINGS" -eq 1 ]; then settings_menu; return 0; fi
   if [ "${#URLS[@]}" -eq 0 ] && [ "${#LISTS[@]}" -eq 0 ]; then
     [ -t 0 ] || die "no links given (see --help)"
