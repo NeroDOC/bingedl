@@ -19,7 +19,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: next
@@ -65,7 +65,7 @@ jobs:
     outputs:
       tag: ${{ steps.t.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: t
@@ -95,7 +95,7 @@ jobs:
           - {os: macos-15-intel, name: macos-amd64}
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.tag.outputs.tag }}
       - name: Build archive
