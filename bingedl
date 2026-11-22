@@ -880,7 +880,8 @@ ffmpeg_line() {
 
 arow() { printf '  %s%-12s%s %s\n' "$C_DIM" "$1" "$C_OFF" "$2"; } # label value
 
-short() { printf '%s' "${1/#$HOME/~}"; }
+# Path with the home directory shown as ~ (prefix removal: ${var/#x/~} expands the ~ in newer bash).
+short() { case $1 in "$HOME") printf '~';; "$HOME"/*) printf '~%s' "${1#"$HOME"}";; *) printf '%s' "$1";; esac; }
 
 # Folders, quality/audio and ffmpeg status shown under the main menu.
 status_panel() {
@@ -986,7 +987,7 @@ settings_menu() {
   local c
   while :; do
     header
-    printf '\n%sSettings%s  %s(%s)%s\n' "$C_BLD" "$C_OFF" "$C_DIM" "${CONFIG_FILE/#$HOME/~}" "$C_OFF"
+    printf '\n%sSettings%s  %s(%s)%s\n' "$C_BLD" "$C_OFF" "$C_DIM" "$(short "$CONFIG_FILE")" "$C_OFF"
     heading "Folders"
     srow 1 "Movies folder" "$MOVIES_DIR"
     srow 2 "Series folder" "$SERIES_DIR"
