@@ -37,7 +37,30 @@ links in, a correctly named season out*.
 
 ## Install
 
-Requires `bash` 3.2+, `curl`, `ffmpeg`, `awk`, `sed`. macOS and Linux (Windows: WSL).
+Requires `bash` 3.2+, `curl`, `awk`, `sed` and, unless you use a ready-made archive, `ffmpeg`.
+macOS and Linux (Windows: WSL).
+
+**Ready-made archive (includes ffmpeg).** Download the file for your system from the
+[latest release](https://github.com/NeroDOC/bingedl/releases/latest), unpack it and run `./bingedl`.
+The script finds the `ffmpeg` next to it.
+
+| System | Archive |
+|---|---|
+| macOS, Apple Silicon | `bingedl-vX.Y.Z-macos-arm64.tar.gz` |
+| macOS, Intel | `bingedl-vX.Y.Z-macos-amd64.tar.gz` |
+| Linux, x86-64 | `bingedl-vX.Y.Z-linux-amd64.tar.gz` |
+
+```sh
+tar -xzf bingedl-v*-macos-arm64.tar.gz
+cd bingedl-v*-macos-arm64
+./bingedl
+```
+
+The bundled ffmpeg is an unmodified GPL build, see `FFMPEG-NOTICE.txt` in the archive. On macOS, if
+Gatekeeper blocks it (the archive was downloaded in a browser), run `xattr -dr com.apple.quarantine .`
+in the unpacked folder.
+
+**From source** (you install ffmpeg yourself, e.g. `brew install ffmpeg`):
 
 ```sh
 git clone https://github.com/NeroDOC/bingedl.git
