@@ -1,0 +1,60 @@
+# git-cliff config: Conventional Commits 1.0.0 in, Keep a Changelog 1.1.0 out.
+# Docs: https://git-cliff.org/docs/configuration
+[changelog]
+header = """
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+"""
+body = """
+{% if version -%}
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else -%}
+## [Unreleased]
+{% endif -%}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+{% for commit in commits %}
+- {% if commit.breaking %}**BREAKING:** {% endif %}{% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}\
+{% endfor %}
+{% endfor %}
+"""
+footer = """
+{% for release in releases -%}
+{% if release.version and release.previous and release.previous.version -%}
+[{{ release.version | trim_start_matches(pat="v") }}]: https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}/compare/{{ release.previous.version }}...{{ release.version }}
+{% elif release.version -%}
+[{{ release.version | trim_start_matches(pat="v") }}]: https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}/releases/tag/{{ release.version }}
+{% elif release.previous and release.previous.version -%}
+[unreleased]: https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}/compare/{{ release.previous.version }}...HEAD
+{% endif -%}
+{% endfor %}
+"""
+trim = true
+
+[remote.github]
+owner = "NeroDOC"
+repo = "bingedl"
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+filter_commits = true
+tag_pattern = "v[0-9]*"
+sort_commits = "oldest"
+# Group order follows the Keep a Changelog spec; the <!-- n --> prefix is stripped in the template.
+commit_parsers = [
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^(docs|test|ci|build|chore|style)(\\([^)]*\\))?:", skip = true },
+  { message = "^feat", group = "<!-- 0 -->Added" },
+  { message = "^(perf|refactor)", group = "<!-- 1 -->Changed" },
+  { message = "^deprecate", group = "<!-- 2 -->Deprecated" },
+  { message = "^revert", group = "<!-- 3 -->Removed" },
+  { message = "^fix", group = "<!-- 4 -->Fixed" },
+  { message = "^security", group = "<!-- 5 -->Security" },
+  { message = "^(docs|test|ci|build|chore|style)", group = "<!-- 1 -->Changed" },
+]

@@ -1,0 +1,5 @@
+.DS_Store
+# local ffmpeg/ffprobe next to the script
+/ffmpeg
+/ffprobe
+*.part
