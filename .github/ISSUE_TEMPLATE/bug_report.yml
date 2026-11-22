@@ -1,0 +1,30 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened and what did you expect?
+    validations: {required: true}
+  - type: textarea
+    id: cmd
+    attributes:
+      label: Command you ran
+      description: Remove tokens from links - they are secrets.
+      render: shell
+    validations: {required: true}
+  - type: textarea
+    id: out
+    attributes:
+      label: Output
+      render: text
+  - type: input
+    id: env
+    attributes:
+      label: bingedl version, OS, ffmpeg version
+      placeholder: "1.0.0, macOS 15 arm64, ffmpeg 9.1"
+    validations: {required: true}
+  - type: markdown
+    attributes:
+      value: DRM-protected streams are not supported and will not be, so issues about them will be closed.

@@ -1,0 +1,1033 @@
+#!/usr/bin/env bash
+#
+# bingedl - download HLS (m3u8) movies and whole series seasons with ffmpeg.
+#
+# Requires: bash 3.2+ (macOS default is fine), curl, ffmpeg, awk, sed.
+# Streams protected by DRM (FairPlay / Widevine / PlayReady) are detected and
+# reported, never downloaded.
+
+VERSION="1.0.0"
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/bingedl"
+CONFIG_FILE="$CONFIG_DIR/config"
+CONFIG_KEYS="MOVIES_DIR SERIES_DIR MAX_HEIGHT AUDIO RETRIES JOBS LAYOUT SPACES NOTIFY_FILE NOTIFY_SEASON NOTIFY_DONE FFMPEG"
+
+# ---------------------------------------------------------------- basics ----
+
+init_colors() {
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'; C_CYN=$'\033[36m'
+    C_DIM=$'\033[2m'; C_BLD=$'\033[1m'; C_OFF=$'\033[0m'
+  else
+    C_RED=""; C_GRN=""; C_YEL=""; C_CYN=""; C_DIM=""; C_BLD=""; C_OFF=""
+  fi
+  # box-drawing glyphs only in a UTF-8 locale
+  case ${LC_ALL:-${LC_CTYPE:-${LANG:-}}} in
+    *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) G_RULE="─"; G_ARR="←"; G_ON="█"; G_OFF="░";;
+    *)                                G_RULE="-"; G_ARR="<-"; G_ON="#"; G_OFF="-";;
+  esac
+}
+
+info() { printf '%s\n' "$*"; }
+warn() { printf '%s!%s %s\n' "$C_YEL" "$C_OFF" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit 1; }
+
+lc()      { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+is_uint() { case $1 in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
+pad2()    { printf '%02d' "$((10#$1))"; }
+
+trim() {
+  local s=$1
+  s=${s#"${s%%[![:space:]]*}"}
+  s=${s%"${s##*[![:space:]]}"}
+  printf '%s' "$s"
+}
+
+expand_tilde() {
+  # shellcheck disable=SC2088
+  case $1 in
+    '~')   printf '%s' "$HOME";;
+    '~/'*) printf '%s/%s' "$HOME" "${1#\~/}";;
+    *)     printf '%s' "$1";;
+  esac
+}
+
+hsize() { awk -v b="$1" 'BEGIN { split("B KB MB GB TB", u, " "); i = 1; while (b >= 1024 && i < 5) { b /= 1024; i++ } printf "%.1f %s", b, u[i] }'; }
+hdur()  { awk -v s="$1" 'BEGIN { printf "%dm%02ds", s / 60, s % 60 }'; }
+fsize() { wc -c <"$1" | tr -d ' '; }
+
+# ---------------------------------------------------------------- config ----
+
+set_defaults() {
+  MOVIES_DIR="$HOME/Movies/bingedl/Movies"
+  SERIES_DIR="$HOME/Movies/bingedl/Series"
+  MAX_HEIGHT="auto"      # auto (best available) | ask | number, e.g. 1080
+  AUDIO="auto"           # auto (default track) | ask | all | names/languages, e.g. uk,en
+  RETRIES="auto"         # auto (= 2 extra attempts) | number
+  JOBS="auto"            # auto (= 1) | number of parallel downloads
+  LAYOUT="folders"       # folders | flat
+  SPACES="underscore"    # underscore | keep   (spaces in file names)
+  NOTIFY_FILE="on"
+  NOTIFY_SEASON="on"
+  NOTIFY_DONE="on"
+  FFMPEG="auto"          # auto (next to script, then PATH) | /path/to/ffmpeg
+}
+
+load_config() {
+  local k v
+  [ -f "$CONFIG_FILE" ] || return 0
+  while IFS='=' read -r k v; do
+    case $k in ''|'#'*) continue;; esac
+    v=${v%\"}; v=${v#\"}
+    case " $CONFIG_KEYS " in
+      *" $k "*) printf -v "$k" '%s' "$v";;
+    esac
+  done <"$CONFIG_FILE"
+}
+
+save_config() {
+  local k
+  mkdir -p "$CONFIG_DIR" || return 1
+  {
+    echo "# bingedl config - change with: bingedl --settings"
+    for k in $CONFIG_KEYS; do printf '%s="%s"\n' "$k" "${!k}"; done
+  } >"$CONFIG_FILE"
+}
+
+# Validate and set one setting. Returns 1 (with a warning) on bad input.
+set_setting() {
+  local k=$1 v=$2
+  case $v in *\"*) warn "quotes are not allowed in settings"; return 1;; esac
+  case $k in
+    MOVIES_DIR|SERIES_DIR)
+      [ -n "$v" ] || { warn "path must not be empty"; return 1; }
+      v=$(expand_tilde "$v");;
+    MAX_HEIGHT)
+      case $v in
+        auto|ask) ;;
+        *) if ! is_uint "$v" || [ "$v" -le 0 ]; then warn "use auto, ask or a number like 1080"; return 1; fi;;
+      esac;;
+    AUDIO)
+      [ -n "$v" ] || { warn "use auto, ask, all or names/languages like uk,en"; return 1; };;
+    RETRIES)
+      case $v in auto) ;; *) is_uint "$v" || { warn "use auto or a number"; return 1; };; esac;;
+    JOBS)
+      case $v in
+        auto) ;;
+        *) if ! is_uint "$v" || [ "$v" -lt 1 ]; then warn "use auto or a number >= 1"; return 1; fi;;
+      esac;;
+    LAYOUT)  case $v in folders|flat) ;; *) warn "use folders or flat"; return 1;; esac;;
+    SPACES)  case $v in underscore|keep) ;; *) warn "use underscore or keep"; return 1;; esac;;
+    NOTIFY_FILE|NOTIFY_SEASON|NOTIFY_DONE)
+             case $v in on|off) ;; *) warn "use on or off"; return 1;; esac;;
+    FFMPEG)
+      if [ "$v" != auto ]; then
+        v=$(expand_tilde "$v")
+        [ -x "$v" ] || { warn "not an executable file: $v"; return 1; }
+      fi;;
+    *) return 1;;
+  esac
+  printf -v "$k" '%s' "$v"
+}
+
+eff_retries() { if [ "$RETRIES" = auto ]; then echo 2; else echo "$RETRIES"; fi; }
+eff_jobs()    { if [ "$JOBS" = auto ]; then echo 1; else echo "$JOBS"; fi; }
+
+# ---------------------------------------------------------------- ffmpeg ----
+
+find_ffmpeg() {
+  local d c
+  [ -n "${FFMPEG_BIN:-}" ] && return 0
+  if [ "$FFMPEG" != auto ] && [ -x "$FFMPEG" ]; then FFMPEG_BIN=$FFMPEG; return 0; fi
+  d=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
+  if [ -n "$d" ] && [ -x "$d/ffmpeg" ]; then FFMPEG_BIN="$d/ffmpeg"; return 0; fi
+  c=$(command -v ffmpeg) && { FFMPEG_BIN=$c; return 0; }
+  return 1
+}
+
+# ------------------------------------------------------- playlist helpers ----
+
+# Resolve a (possibly relative) playlist URI against the playlist's own URL.
+resolve_url() { # base rel
+  local base=$1 rel=$2 origin path full n
+  case $rel in http://*|https://*) printf '%s' "$rel"; return;; esac
+  base=${base%%[#]*}
+  origin=$(printf '%s' "$base" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://[^/]+).*#\1#')
+  case $rel in
+    //*) printf '%s:%s' "${base%%:*}" "$rel"; return;;
+    /*)  printf '%s%s' "$origin" "$rel"; return;;
+  esac
+  path=${base#"$origin"}
+  path=${path%%\?*}
+  full="${path%/*}/$rel"
+  while :; do
+    n=$(printf '%s' "$full" | sed -E 's#/[^/]+/\.\./#/#; s#/\./#/#')
+    [ "$n" = "$full" ] && break
+    full=$n
+  done
+  printf '%s%s' "$origin" "$full"
+}
+
+# Read one attribute from an #EXT-X-... line (quoted or unquoted value).
+attr() { # line KEY
+  local v
+  v=$(printf '%s' "$1" | sed -n -E "s/.*[:,]$2=\"([^\"]*)\".*/\1/p")
+  [ -n "$v" ] || v=$(printf '%s' "$1" | sed -n -E "s/.*[:,]$2=([^,\"]*).*/\1/p")
+  printf '%s' "$v"
+}
+
+is_drm() {
+  printf '%s\n' "$1" | grep -qiE 'skd://|streamingkeydelivery|METHOD=SAMPLE-AES|widevine|playready|urn:uuid:'
+}
+
+playlist_duration() {
+  printf '%s\n' "$1" | awk -F'[:,]' '/^#EXTINF:/ { s += $2 } END { printf "%.2f", s + 0 }'
+}
+
+# master playlist -> lines "bandwidth<TAB>height<TAB>audio-group<TAB>uri" ("-" = none)
+parse_variants() {
+  local line pending="" bw res h ag
+  while IFS= read -r line; do
+    case $line in
+      '#EXT-X-STREAM-INF'*) pending=$line;;
+      '#'*|'') ;;
+      *)
+        if [ -n "$pending" ]; then
+          bw=$(attr "$pending" BANDWIDTH); res=$(attr "$pending" RESOLUTION)
+          ag=$(attr "$pending" AUDIO); h=${res#*x}
+          [ -n "$res" ] || h=0
+          printf '%s\t%s\t%s\t%s\n' "${bw:-0}" "${h:-0}" "${ag:--}" "$(trim "$line")"
+          pending=""
+        fi;;
+    esac
+  done <<<"$1"
+}
+
+# stdin: variant lines. Picks highest bandwidth with height <= max (0 = no limit);
+# if every variant is taller than max, picks the smallest one.
+pick_variant() { # max
+  awk -F'\t' -v max="$1" '
+    {
+      if (max == 0 || $2 + 0 == 0 || $2 + 0 <= max) {
+        if (ok == "" || $1 + 0 > obw) { obw = $1 + 0; ok = $0 }
+      } else if (lo == "" || $2 + 0 < lh || ($2 + 0 == lh && $1 + 0 > lbw)) {
+        lh = $2 + 0; lbw = $1 + 0; lo = $0
+      }
+    }
+    END { print (ok != "" ? ok : lo) }'
+}
+
+# master + audio group + base url -> lines "name<TAB>lang<TAB>default<TAB>url" ("-" = empty)
+parse_audio() {
+  local line uri n l d
+  while IFS= read -r line; do
+    case $line in '#EXT-X-MEDIA:'*) ;; *) continue;; esac
+    [ "$(attr "$line" TYPE)" = AUDIO ] || continue
+    [ "$(attr "$line" GROUP-ID)" = "$2" ] || continue
+    uri=$(attr "$line" URI)
+    [ -n "$uri" ] || continue
+    n=$(attr "$line" NAME); l=$(attr "$line" LANGUAGE); d=$(attr "$line" DEFAULT)
+    printf '%s\t%s\t%s\t%s\n' "${n:--}" "${l:--}" "${d:-NO}" "$(resolve_url "$3" "$uri")"
+  done <<<"$1"
+}
+
+iso3() { # language tag -> ISO 639-2 (what mp4 wants)
+  local l
+  l=$(lc "${1%%-*}")
+  case $l in
+    uk) echo ukr;; en) echo eng;; ru) echo rus;; pl) echo pol;; de) echo deu;;
+    fr) echo fra;; es) echo spa;; it) echo ita;; ja) echo jpn;;
+    ???) echo "$l";;
+    *) echo und;;
+  esac
+}
+
+# --------------------------------------------------------------- fetching ----
+
+fetch_pl() { # url -> PL (body), PL_CODE; returns 0 on HTTP 2xx
+  local tmp="$WORK/pl.tmp" code
+  rm -f "$tmp"
+  code=$(curl -sS -L --max-time 25 --retry 2 -o "$tmp" -w '%{http_code}' "$1" 2>/dev/null) || code=000
+  PL_CODE=$code
+  PL=""
+  [ -f "$tmp" ] && PL=$(tr -d '\r' <"$tmp")
+  case $code in 2??) return 0;; esac
+  return 1
+}
+
+http_err() {
+  case $PL_CODE in
+    401|403) printf 'HTTP %s - access denied or token expired' "$PL_CODE";;
+    404)     printf 'HTTP 404 - not found';;
+    000)     printf 'network error (cannot reach the host)';;
+    *)       printf 'HTTP %s' "$PL_CODE";;
+  esac
+}
+
+# ------------------------------------------------- quality & audio choice ----
+
+# sets MAXH (0 = unlimited) from the MAX_HEIGHT setting; may ask once per run
+compute_maxh() { # variants
+  local heights h n=0 i c
+  MAXH=0
+  case $MAX_HEIGHT in
+    auto|'') return 0;;
+    ask)
+      if [ -n "$HEIGHT_MEMO" ]; then MAXH=$HEIGHT_MEMO; return 0; fi
+      heights=$(printf '%s\n' "$1" | cut -f2 | sort -rnu)
+      n=$(printf '%s\n' "$heights" | grep -c .)
+      if [ "$n" -gt 1 ] && [ -t 0 ]; then
+        info "Available qualities:"
+        i=0
+        for h in $heights; do i=$((i+1)); printf '  %d) %sp\n' "$i" "$h"; done
+        read -r -p "Max quality [1 = best]: " c
+        c=${c:-1}
+        if is_uint "$c" && [ "$c" -ge 1 ] && [ "$c" -le "$n" ]; then
+          MAXH=$(printf '%s\n' "$heights" | sed -n "${c}p")
+          [ "$c" -eq 1 ] && MAXH=0
+        fi
+      fi
+      HEIGHT_MEMO=$MAXH;;
+    *) MAXH=$MAX_HEIGHT;;
+  esac
+}
+
+auto_audio() { # sets SEL to the default track (or first)
+  local i d=0
+  for ((i = 0; i < ${#AN[@]}; i++)); do
+    if [ "${AD[$i]}" = YES ]; then d=$i; break; fi
+  done
+  SEL=" $d"
+}
+
+ask_audio() {
+  local i n=${#AN[@]} c names="" tag
+  info "Audio tracks:"
+  for ((i = 0; i < n; i++)); do
+    tag=""; [ "${AD[$i]}" = YES ] && tag=" (default)"
+    printf '  %d) %s [%s]%s\n' "$((i+1))" "${AN[$i]}" "${AL[$i]}" "$tag"
+  done
+  read -r -p "Tracks to download (e.g. 1 2, all; Enter = default): " c
+  c=${c//,/ }
+  SEL=""
+  case $(lc "$c") in
+    '') auto_audio;;
+    all) for ((i = 0; i < n; i++)); do SEL="$SEL $i"; done;;
+    *) for i in $c; do
+         if is_uint "$i" && [ "$i" -ge 1 ] && [ "$i" -le "$n" ]; then SEL="$SEL $((i-1))"; fi
+       done
+       [ -n "$SEL" ] || auto_audio;;
+  esac
+  if [ "$(lc "$c")" = all ]; then
+    AUDIO_MEMO=all
+  else
+    for i in $SEL; do names="$names,${AN[$i]}"; done
+    AUDIO_MEMO=${names#,}
+  fi
+}
+
+# fills SEL (space-separated indexes into AN/AL/AD/AU)
+choose_audio() {
+  local n=${#AN[@]} i mode tok t
+  SEL=""
+  [ "$n" -gt 0 ] || return 0
+  mode=$AUDIO
+  if [ "$mode" = ask ]; then
+    if [ -n "$AUDIO_MEMO" ]; then
+      mode=$AUDIO_MEMO
+    elif [ "$n" -gt 1 ] && [ -t 0 ]; then
+      ask_audio; return 0
+    else
+      mode=auto
+    fi
+  fi
+  case $mode in
+    auto) auto_audio;;
+    all)  for ((i = 0; i < n; i++)); do SEL="$SEL $i"; done;;
+    *)
+      local IFS=,
+      for tok in $mode; do
+        t=$(lc "$(trim "$tok")")
+        for ((i = 0; i < n; i++)); do
+          if [ "$(lc "${AN[$i]}")" = "$t" ] || [ "$(lc "${AL[$i]}")" = "$t" ]; then
+            case " $SEL " in *" $i "*) ;; *) SEL="$SEL $i";; esac
+          fi
+        done
+      done
+      unset IFS
+      if [ -z "$SEL" ]; then
+        warn "no audio track matches '$mode' - using the default one"
+        auto_audio
+      fi;;
+  esac
+}
+
+# ---------------------------------------------------------------- prepare ----
+
+# Resolve url -> chosen video playlist + audio renditions. Sets P_* globals; ERR on failure.
+prepare() {
+  local url=$1 master media variants best bw h ag uri aud n l d u i
+  P_VIDEO=""; P_HEIGHT=0; P_DUR=0; P_AURLS=(); P_ALANGS=(); P_ANAMES=(); ERR=""
+  AN=(); AL=(); AD=(); AU=(); SEL=""
+
+  if ! fetch_pl "$url"; then ERR=$(http_err); return 1; fi
+  master=$PL
+  case $master in *'#EXTM3U'*) ;; *) ERR="not an HLS playlist (does the link point to an .m3u8?)"; return 1;; esac
+  if is_drm "$master"; then ERR="DRM-protected stream (FairPlay/Widevine/PlayReady)"; return 1; fi
+
+  if printf '%s\n' "$master" | grep -q '^#EXT-X-STREAM-INF'; then
+    variants=$(parse_variants "$master")
+    [ -n "$variants" ] || { ERR="master playlist has no variants"; return 1; }
+    compute_maxh "$variants"
+    best=$(printf '%s\n' "$variants" | pick_variant "$MAXH")
+    IFS=$'\t' read -r bw h ag uri <<<"$best"
+    P_VIDEO=$(resolve_url "$url" "$uri")
+    P_HEIGHT=$h
+    if ! fetch_pl "$P_VIDEO"; then ERR="variant playlist: $(http_err)"; return 1; fi
+    media=$PL
+    if [ "$ag" != "-" ]; then
+      aud=$(parse_audio "$master" "$ag" "$url")
+      if [ -n "$aud" ]; then
+        while IFS=$'\t' read -r n l d u; do
+          [ "$n" = "-" ] && n=""; [ "$l" = "-" ] && l=""
+          AN+=("$n"); AL+=("$l"); AD+=("$d"); AU+=("$u")
+        done <<<"$aud"
+        choose_audio
+        for i in $SEL; do
+          P_AURLS+=("${AU[$i]}"); P_ALANGS+=("${AL[$i]}"); P_ANAMES+=("${AN[$i]}")
+          if fetch_pl "${AU[$i]}" && is_drm "$PL"; then ERR="DRM-protected audio track"; return 1; fi
+        done
+      fi
+    fi
+  else
+    P_VIDEO=$url; media=$master
+  fi
+
+  if is_drm "$media"; then ERR="DRM-protected stream (FairPlay/Widevine/PlayReady)"; return 1; fi
+  P_DUR=$(playlist_duration "$media")
+  return 0
+}
+
+# --------------------------------------------------------------- download ----
+
+build_cmd() { # part
+  local i
+  CMD=("$FFMPEG_BIN" -nostdin -hide_banner -loglevel error -progress pipe:1 -nostats
+       -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 -i "$P_VIDEO")
+  for ((i = 0; i < ${#P_AURLS[@]}; i++)); do
+    CMD+=(-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10 -i "${P_AURLS[$i]}")
+  done
+  CMD+=(-map '0:v:0?')
+  if [ "${#P_AURLS[@]}" -eq 0 ]; then
+    CMD+=(-map '0:a?')
+  else
+    for ((i = 0; i < ${#P_AURLS[@]}; i++)); do
+      CMD+=(-map "$((i+1)):a:0"
+            -metadata:s:a:"$i" language="$(iso3 "${P_ALANGS[$i]}")"
+            -metadata:s:a:"$i" title="${P_ANAMES[$i]}")
+    done
+  fi
+  CMD+=(-c copy -movflags +faststart -f mp4 -y "$1")
+}
+
+draw_bar() { # label duration  (reads ffmpeg -progress output on stdin)
+  local line us=0 sp="" sz=0 v cols
+  cols=$(tput cols 2>/dev/null); is_uint "$cols" || cols=80
+  while IFS= read -r line; do
+    case $line in
+      out_time_us=*|out_time_ms=*) v=${line#*=}; if is_uint "$v"; then us=$v; fi;;
+      total_size=*) v=${line#*=}; if is_uint "$v"; then sz=$v; fi;;
+      speed=*) sp=${line#*=};;
+      progress=*)
+        awk -v us="$us" -v dur="$2" -v sz="$sz" -v sp="$sp" -v cols="$cols" -v label="$1" -v on="$G_ON" -v off="$G_OFF" -v cg="$C_GRN" -v co="$C_OFF" '
+          BEGIN {
+            t = us / 1e6; p = (dur > 0) ? t / dur : 0; if (p > 1) p = 1
+            s = sp; gsub(/x/, "", s); eta = ""
+            if (dur > 0 && s + 0 > 0) { r = (dur - t) / s; if (r < 0) r = 0; eta = sprintf(" ETA %d:%02d", r / 60, r % 60) }
+            spd = (sp != "" && sp != "N/A") ? sp " " : ""
+            tail = sprintf(" %3d%% %s%.0f MB%s", p * 100, spd, sz / 1048576, eta)
+            w = 24; n = int(p * w); bar = ""
+            for (i = 0; i < w; i++) bar = bar (i < n ? on : off)
+            lw = cols - w - length(tail) - 5; if (lw < 8) lw = 8
+            if (length(label) > lw) label = substr(label, 1, lw - 1) "~"
+            printf "\r\033[K%s [%s%s%s]%s", label, cg, bar, co, tail
+          }';;
+    esac
+  done
+  printf '\r\033[K'
+}
+
+run_ffmpeg() { # label errlog
+  local rc
+  if [ "$SHOW_BAR" -eq 1 ]; then
+    "${CMD[@]}" 2>"$2" | draw_bar "$1" "$P_DUR"
+    rc=${PIPESTATUS[0]}
+  else
+    "${CMD[@]}" >/dev/null 2>"$2"
+    rc=$?
+  fi
+  return "$rc"
+}
+
+file_duration() {
+  local d
+  d=$("$FFMPEG_BIN" -nostdin -hide_banner -i "$1" 2>&1 \
+      | sed -n 's/.*Duration: \([0-9][0-9]*\):\([0-9][0-9]\):\([0-9][0-9.]*\).*/\1 \2 \3/p' | head -1)
+  [ -n "$d" ] || { echo 0; return; }
+  printf '%s\n' "$d" | awk '{ printf "%.1f", $1 * 3600 + $2 * 60 + $3 }'
+}
+
+duration_ok() { # got expected
+  awk -v g="$1" -v e="$2" 'BEGIN {
+    if (e <= 0) exit 0
+    d = g - e; if (d < 0) d = -d
+    tol = e * 0.02; if (tol < 5) tol = 5
+    exit (d <= tol) ? 0 : 1 }'
+}
+
+classify_error() { # errlog rc -> sets reason, fatal
+  local f=$1 last
+  fatal=0
+  if grep -qiE 'skd://|key file|decrypt' "$f"; then
+    reason="cannot obtain decryption key (DRM?)"; fatal=1
+  elif grep -qiE 'Server returned 40[13]|HTTP error 40[13]|403 Forbidden|401 Unauthorized' "$f"; then
+    reason="HTTP 401/403 - access denied or token expired"; fatal=1
+  elif grep -qiE 'Server returned 404|HTTP error 404' "$f"; then
+    reason="HTTP 404 - segment not found"; fatal=1
+  elif grep -qi 'No space left' "$f"; then
+    reason="no space left on device"; fatal=1
+  else
+    last=$(grep -v '^[[:space:]]*$' "$f" | tail -1)
+    reason=${last:-ffmpeg failed (exit $2)}
+    reason=${reason:0:160}
+  fi
+}
+
+notify() { # title message
+  case $(uname) in
+    Darwin)
+      osascript -e 'on run argv' \
+                -e 'display notification (item 1 of argv) with title (item 2 of argv)' \
+                -e 'end run' "$2" "$1" >/dev/null 2>&1;;
+    *) command -v notify-send >/dev/null 2>&1 && notify-send "$1" "$2";;
+  esac
+  return 0
+}
+
+# status season label detail
+finish_file() {
+  local st=$1 season=$2 label=$3 detail=$4
+  printf '%s\t%s\t%s\t%s\n' "$st" "$season" "$label" "${detail:--}" >>"$WORK/results"
+  case $st in
+    ok)   printf '  %s✓%s %s %s(%s)%s\n' "$C_GRN" "$C_OFF" "$label" "$C_DIM" "$detail" "$C_OFF";;
+    fail) printf '  %s✗%s %s: %s\n' "$C_RED" "$C_OFF" "$label" "$detail";;
+    skip) printf '  %s-%s %s %s(%s)%s\n' "$C_DIM" "$C_OFF" "$label" "$C_DIM" "$detail" "$C_OFF";;
+  esac
+  [ "$st" = skip ] && return 0
+  local msg="$label"
+  [ "$st" = ok ] && msg="✓ $label" || msg="✗ $label: $detail"
+  if [ "$MODE" = movie ]; then
+    if [ "$NOTIFY_FILE" = on ] || [ "$NOTIFY_DONE" = on ]; then notify "$TITLE" "$msg"; fi
+  elif [ "$NOTIFY_FILE" = on ]; then
+    notify "$TITLE" "$msg"
+  fi
+  return 0
+}
+
+download_item() { # out label season
+  local out=$1 label=$2 season=$3 part errlog attempt=1 max rc got start size
+  part="$out.part"
+  if ! mkdir -p "$(dirname "$out")"; then finish_file fail "$season" "$label" "cannot create folder"; return 1; fi
+  echo "$part" >>"$WORK/parts"
+  errlog=$(mktemp "$WORK/err.XXXXXX")
+  max=$(( $(eff_retries) + 1 ))
+  build_cmd "$part"
+  start=$SECONDS
+  while :; do
+    rm -f "$part"
+    : >"$errlog"
+    reason=""; fatal=0
+    run_ffmpeg "$label" "$errlog"; rc=$?
+    if [ "$rc" -eq 0 ]; then
+      got=$(file_duration "$part")
+      if duration_ok "$got" "$P_DUR"; then
+        mv -f "$part" "$out"
+        size=$(hsize "$(fsize "$out")")
+        finish_file ok "$season" "$label" "$size, $(hdur $((SECONDS - start)))"
+        rm -f "$errlog"
+        return 0
+      fi
+      reason="incomplete file (got ${got}s of ${P_DUR}s)"
+    else
+      classify_error "$errlog" "$rc"
+    fi
+    if [ "$fatal" -eq 1 ] || [ "$attempt" -ge "$max" ]; then
+      rm -f "$part" "$errlog"
+      finish_file fail "$season" "$label" "$reason"
+      return 1
+    fi
+    attempt=$((attempt + 1))
+    warn "$label: $reason - retry $((attempt - 1))/$((max - 1))"
+    sleep $((attempt * 3))
+  done
+}
+
+# ------------------------------------------------------------ naming/paths ----
+
+fs_clean() { printf '%s' "$1" | tr '/\\:*?"<>|' '_' | tr -s ' ' ' ' | sed -E 's/^[ .]+//; s/[ .]+$//'; }
+fs_dir()   { fs_clean "$1"; }
+fs_name()  {
+  if [ "$SPACES" = underscore ]; then fs_clean "$1" | tr ' ' '_' | tr -s '_'; else fs_clean "$1"; fi
+}
+
+strip_slashes() { local p=$1; while [ "${p%/}" != "$p" ]; do p=${p%/}; done; printf '%s' "$p"; }
+
+out_path() { # season ep
+  local base name
+  if [ "$MODE" = movie ]; then
+    base=$(strip_slashes "${OUTPUT_OVERRIDE:-$MOVIES_DIR}")
+    name="$(fs_name "$TITLE").mp4"
+    [ "$LAYOUT" = folders ] && base="$base/$(fs_dir "$TITLE")"
+  else
+    base=$(strip_slashes "${OUTPUT_OVERRIDE:-$SERIES_DIR}")
+    name=$(printf '%s_S%02dEp%02d.mp4' "$(fs_name "$TITLE")" "$((10#$1))" "$((10#$2))")
+    [ "$LAYOUT" = folders ] && base="$base/$(fs_dir "$TITLE")/Season $(pad2 "$1")"
+  fi
+  printf '%s/%s' "$base" "$name"
+}
+
+# ------------------------------------------------------------------ queue ----
+
+add_link() {
+  local u
+  u=$(trim "${1%%[[:space:]]#*}")   # trailing " # comment" is ignored
+  case $u in
+    '') ;;
+    http://*|https://*)
+      printf '%s\t%s\t%s\n' "$Q_SEASON" "$Q_EP" "$u" >>"$QUEUE"
+      Q_EP=$((Q_EP + 1));;
+    *) warn "ignored (not an http/https link): $u";;
+  esac
+}
+
+directive() { # "@season 2" | "@start 5"
+  local d=${1#@} k v
+  d=${d%%[[:space:]]#*}
+  k=${d%%[[:space:]]*}
+  v=$(trim "${d#"$k"}")
+  case $k in
+    season) if is_uint "$v"; then Q_SEASON=$((10#$v)); Q_EP=1; else warn "bad @season value: $v"; fi;;
+    start)  if is_uint "$v"; then Q_EP=$((10#$v)); else warn "bad @start value: $v"; fi;;
+    *)      warn "unknown directive: $1";;
+  esac
+}
+
+read_listfile() { # path | -
+  local f=$1 line
+  if [ "$f" = - ]; then
+    f=/dev/stdin
+  else
+    f=$(expand_tilde "$f")
+    [ -r "$f" ] || { warn "cannot read $f"; return 1; }
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=$(trim "${line%$'\r'}")
+    case $line in
+      ''|'#'*) ;;
+      @*) directive "$line";;
+      *)  add_link "$line";;
+    esac
+  done <"$f"
+}
+
+shorten_url() { printf '%s' "$1" | sed -E 's#^(https?://[^/]+).*#\1/...#'; }
+
+show_plan() {
+  local season ep url out mark
+  printf '\n%s %s%s%s\n' "$MODE:" "$C_BLD" "$TITLE" "$C_OFF"
+  while IFS=$'\t' read -r season ep url <&3; do
+    out=$(out_path "$season" "$ep")
+    mark=""
+    if [ -e "$out" ] && [ "$OVERWRITE" -eq 0 ]; then mark=" ${C_DIM}(exists - will be skipped)${C_OFF}"; fi
+    printf '  %s%s\n      %s%s %s%s\n' "$out" "$mark" "$C_DIM" "$G_ARR" "$(shorten_url "$url")" "$C_OFF"
+  done 3<"$QUEUE"
+  echo
+}
+
+confirm() { local a; read -r -p "$1 [Y/n] " a || return 1; case $a in n|N|no|NO) return 1;; *) return 0;; esac; }
+
+# -------------------------------------------------------------- run queue ----
+
+finish_season() { # season
+  local s=$1 ok fail skip msg
+  [ "$NJ" -gt 1 ] && wait
+  ok=$(awk -F'\t' -v s="$s" '$1 == "ok"   && $2 == s' "$WORK/results" | wc -l | tr -d ' ')
+  fail=$(awk -F'\t' -v s="$s" '$1 == "fail" && $2 == s' "$WORK/results" | wc -l | tr -d ' ')
+  skip=$(awk -F'\t' -v s="$s" '$1 == "skip" && $2 == s' "$WORK/results" | wc -l | tr -d ' ')
+  if [ "$MODE" = series ]; then
+    msg="Season $s: $ok downloaded, $skip skipped, $fail failed"
+    info "$msg"
+    [ "$NOTIFY_SEASON" = on ] && notify "$TITLE" "$msg"
+  fi
+  return 0
+}
+
+print_summary() {
+  local ok fail skip nseasons
+  ok=$(awk -F'\t' '$1 == "ok"' "$WORK/results" | wc -l | tr -d ' ')
+  fail=$(awk -F'\t' '$1 == "fail"' "$WORK/results" | wc -l | tr -d ' ')
+  skip=$(awk -F'\t' '$1 == "skip"' "$WORK/results" | wc -l | tr -d ' ')
+  nseasons=$(cut -f2 "$WORK/results" | sort -u | grep -c .)
+  local fc=$C_DIM; [ "$fail" -gt 0 ] && fc=$C_RED
+  echo; rule
+  printf '%sSummary:%s %s%s downloaded%s, %s skipped, %s%s failed%s\n' "$C_BLD" "$C_OFF" "$C_GRN" "$ok" "$C_OFF" "$skip" "$fc" "$fail" "$C_OFF"
+  if [ "$fail" -gt 0 ]; then
+    awk -F'\t' '$1 == "fail" { printf "  ✗ %s: %s\n", $3, $4 }' "$WORK/results"
+    RC=1
+  fi
+  if [ "$MODE" = series ] && [ "$NOTIFY_DONE" = on ] && [ "$nseasons" -gt 1 ]; then
+    notify "$TITLE" "All done: $ok downloaded, $skip skipped, $fail failed"
+  fi
+}
+
+run_queue() {
+  local nj total idx=0 season ep url prev="" out label info_line i
+  NJ=$(eff_jobs)
+  [ "$MODE" = movie ] && NJ=1
+  nj=$NJ
+  total=$(wc -l <"$QUEUE" | tr -d ' ')
+  SHOW_BAR=0
+  if [ "$nj" -eq 1 ] && [ -t 1 ] && [ "$NO_PROGRESS" -eq 0 ]; then SHOW_BAR=1; fi
+  HEIGHT_MEMO=""; AUDIO_MEMO=""
+  : >"$WORK/results"; : >"$WORK/parts"
+  RC=0
+
+  while IFS=$'\t' read -r season ep url <&3; do
+    idx=$((idx + 1))
+    if [ -n "$prev" ] && [ "$season" != "$prev" ]; then finish_season "$prev"; fi
+    prev=$season
+    out=$(out_path "$season" "$ep"); label=$(basename "$out")
+
+    if [ -e "$out" ] && [ "$OVERWRITE" -eq 0 ]; then
+      finish_file skip "$season" "$label" "already exists"
+      continue
+    fi
+    if [ "$nj" -gt 1 ]; then
+      while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "$nj" ]; do sleep 1; done
+    fi
+
+    info "[$idx/$total] $label"
+    if ! prepare "$url"; then finish_file fail "$season" "$label" "$ERR"; continue; fi
+    info_line="      "
+    [ "$P_HEIGHT" != 0 ] && info_line="${info_line}${P_HEIGHT}p  "
+    if [ "${#P_ANAMES[@]}" -gt 0 ]; then
+      info_line="${info_line}audio:"
+      for ((i = 0; i < ${#P_ANAMES[@]}; i++)); do info_line="$info_line ${P_ANAMES[$i]:-${P_ALANGS[$i]:-track}}"; done
+    fi
+    [ "$info_line" != "      " ] && printf '%s%s%s\n' "$C_DIM" "$info_line" "$C_OFF"
+
+    if [ "$nj" -gt 1 ]; then
+      download_item "$out" "$label" "$season" &
+    else
+      download_item "$out" "$label" "$season"
+    fi
+  done 3<"$QUEUE"
+
+  [ -n "$prev" ] && finish_season "$prev"
+  wait
+  print_summary
+}
+
+start_run() {
+  find_ffmpeg || die "ffmpeg not found. Install it (brew install ffmpeg), put the binary next to this script, or set its path in --settings."
+  command -v curl >/dev/null 2>&1 || die "curl not found"
+  run_queue
+}
+
+# ------------------------------------------------------------ interactive ----
+
+# Clear the screen (terminal only), print the title with the version and, once,
+# the last status message. Called at the top of every menu.
+header() {
+  if [ -t 1 ] && [ -z "${NO_CLEAR:-}" ]; then printf '\033[H\033[2J'; fi
+  printf '%s%sbingedl%s v%s\n' "$C_BLD" "$C_CYN" "$C_OFF" "$VERSION"
+  rule
+  if [ -n "$STATUS" ]; then printf '%s%s%s\n' "$C_GRN" "$STATUS" "$C_OFF"; STATUS=""; fi
+}
+
+# Dim horizontal rule, at most 60 columns wide; terminal only.
+rule() {
+  local n
+  [ -t 1 ] || return 0
+  n=$(tput cols 2>/dev/null); is_uint "$n" || n=60
+  [ "$n" -gt 60 ] && n=60
+  printf '%s' "$C_DIM"
+  awk -v n="$n" -v g="$G_RULE" 'BEGIN { for (i = 0; i < n; i++) printf "%s", g; printf "\n" }'
+  printf '%s' "$C_OFF"
+}
+
+menu_item() { printf '  %s[%s]%s %s\n' "$C_CYN" "$1" "$C_OFF" "$2"; }                # key label
+heading()   { printf '\n  %s%s%s\n' "$C_BLD" "$1" "$C_OFF"; }
+srow()      { printf '    %s%-4s%s %-22s %s%s%s  %s%s%s\n' "$C_CYN" "[$1]" "$C_OFF" "$2" "$C_BLD" "$3" "$C_OFF" "$C_DIM" "${4:-}" "$C_OFF"; } # key label value hint
+
+# Keep output (results, warnings) on screen until a key is pressed, before the next clear.
+pause() { if [ -t 0 ]; then read -r -p "Press Enter to continue..." _; fi; return 0; }
+
+interactive_movie() {
+  local link
+  header; info "Download a movie"
+  MODE=movie; : >"$QUEUE"
+  if [ -z "$TITLE" ]; then
+    read -r -p "Movie title: " TITLE || return 0
+    TITLE=$(trim "$TITLE")
+    [ -n "$TITLE" ] || return 0
+  fi
+  read -r -p "m3u8 link: " link || return 0
+  Q_SEASON=1; Q_EP=1
+  add_link "$link"
+  [ -s "$QUEUE" ] || { info "Nothing queued."; return 0; }
+  show_plan
+  confirm "Start download?" || return 0
+  start_run
+}
+
+interactive_series() {
+  local s=${SEASON_OPT:-} e=${START_OPT:-} line
+  header; info "Download a series / seasons"
+  MODE=series; : >"$QUEUE"
+  if [ -z "$TITLE" ]; then
+    read -r -p "Series name: " TITLE || return 0
+    TITLE=$(trim "$TITLE")
+    [ -n "$TITLE" ] || return 0
+  fi
+  if [ -z "$s" ]; then read -r -p "Season [1]: " s; s=${s:-1}; fi
+  if [ -z "$e" ]; then read -r -p "First episode [1]: " e; e=${e:-1}; fi
+  if ! is_uint "$s" || ! is_uint "$e"; then warn "season and episode must be numbers"; return 0; fi
+  Q_SEASON=$((10#$s)); Q_EP=$((10#$e))
+  info "Paste one link per line. Empty line = continue. Also: @season N, @start N, @file PATH"
+  while :; do
+    printf 'S%sE%s link: ' "$(pad2 "$Q_SEASON")" "$(pad2 "$Q_EP")"
+    read -r line || break
+    line=$(trim "$line")
+    [ -z "$line" ] && break
+    case $line in
+      @file*) read_listfile "$(trim "${line#@file}")";;
+      @*)     directive "$line";;
+      *)      add_link "$line";;
+    esac
+  done
+  [ -s "$QUEUE" ] || { info "Nothing queued."; return 0; }
+  show_plan
+  confirm "Start download?" || return 0
+  start_run
+}
+
+ask_set() { # key label hint
+  local v
+  read -r -p "$2 [$3]: " v || return 0
+  v=$(trim "$v")
+  [ -n "$v" ] || return 0
+  if set_setting "$1" "$v"; then save_config && STATUS="saved."; else pause; fi
+}
+
+toggle() { # key a b
+  if [ "${!1}" = "$2" ]; then set_setting "$1" "$3"; else set_setting "$1" "$2"; fi
+  save_config
+}
+
+settings_menu() {
+  local c
+  while :; do
+    header
+    printf '\n%sSettings%s  %s(%s)%s\n' "$C_BLD" "$C_OFF" "$C_DIM" "${CONFIG_FILE/#$HOME/~}" "$C_OFF"
+    heading "Folders"
+    srow 1 "Movies folder" "$MOVIES_DIR"
+    srow 2 "Series folder" "$SERIES_DIR"
+    heading "Download"
+    srow 3 "Max quality" "$MAX_HEIGHT" "auto = best | ask | 720 | 1080 ..."
+    srow 4 "Audio tracks" "$AUDIO" "auto = default | ask | all | uk,en ..."
+    srow 5 "Retries" "$RETRIES" "auto = 2 | number"
+    srow 6 "Parallel downloads" "$JOBS" "auto = 1 | number"
+    srow 7 "Folder layout" "$LAYOUT" "folders | flat"
+    srow 8 "Spaces in file names" "$SPACES" "underscore | keep"
+    heading "Notifications"
+    srow 9 "After each file" "$NOTIFY_FILE"
+    srow 10 "After a season" "$NOTIFY_SEASON"
+    srow 11 "When all done" "$NOTIFY_DONE"
+    heading "Other"
+    srow 12 "ffmpeg path" "$FFMPEG" "auto | /path/to/ffmpeg"
+    printf '\n  %s[r]%s Reset to defaults   %s[b]%s Back\n' "$C_CYN" "$C_OFF" "$C_CYN" "$C_OFF"
+    read -r -p "> " c || return 0
+    case $c in
+      1) ask_set MOVIES_DIR "Movies folder" "path";;
+      2) ask_set SERIES_DIR "Series folder" "path";;
+      3) ask_set MAX_HEIGHT "Max quality" "auto | ask | number";;
+      4) ask_set AUDIO "Audio tracks" "auto | ask | all | uk,en";;
+      5) ask_set RETRIES "Retries" "auto | number";;
+      6) ask_set JOBS "Parallel downloads" "auto | number";;
+      7) toggle LAYOUT folders flat;;
+      8) toggle SPACES underscore keep;;
+      9) toggle NOTIFY_FILE on off;;
+      10) toggle NOTIFY_SEASON on off;;
+      11) toggle NOTIFY_DONE on off;;
+      12) ask_set FFMPEG "ffmpeg path" "auto | path";;
+      r|R) set_defaults; save_config; STATUS="reset.";;
+      b|B|q|Q|'') return 0;;
+    esac
+  done
+}
+
+interactive() {
+  local c
+  while :; do
+    header
+    echo
+    menu_item 1 "Download a movie"
+    menu_item 2 "Download a series / seasons"
+    menu_item 3 "Settings"
+    menu_item q "Quit"
+    read -r -p "> " c || return 0
+    case $c in
+      1) interactive_movie; pause;;
+      2) interactive_series; pause;;
+      3) settings_menu;;
+      q|Q|'') return 0;;
+    esac
+    TITLE=""; SEASON_OPT=""; START_OPT=""
+  done
+}
+
+# -------------------------------------------------------------------- CLI ----
+
+usage() {
+  cat <<EOF
+bingedl $VERSION - download HLS (m3u8) movies and series with ffmpeg
+
+Usage:
+  bingedl                                  interactive menu
+  bingedl -m -n "Title" URL                one movie
+  bingedl -s -n "Name" -S 2 URL [URL...]   episodes of one season
+  bingedl -s -n "Name" -S 2 -f links.txt   episodes from a list file
+
+Options:
+  -m, --movie              movie mode
+  -s, --series             series mode (inferred from --season/--start/--file/several links)
+  -n, --name NAME          movie title / series name
+  -S, --season N           season number (default 1)
+  -e, --start N            first episode number (default 1)
+  -f, --file FILE          read links from FILE ('-' = stdin); can be repeated
+  -q, --max-height N|auto|ask   highest quality to download (default: from config)
+  -a, --audio auto|all|ask|uk,en   which audio tracks to keep
+  -o, --output DIR         output folder (overrides the configured one)
+  -j, --jobs N|auto        parallel downloads (progress bar is off when N > 1)
+  -r, --retries N|auto     extra attempts per file
+      --overwrite          re-download files that already exist
+      --dry-run            show what would be downloaded and where, then exit
+      --no-progress        plain output instead of a progress bar
+      --settings           open the settings menu
+  -h, --help               this help
+  -V, --version
+
+List file format (one link per line):
+  # comment
+  @season 2        start season 2 (episode counter resets to 1)
+  @start 5         next link is episode 5
+  https://example.com/ep1/master.m3u8
+  https://example.com/ep2/master.m3u8
+
+Files are named Name_S02Ep03.mp4. Settings live in:
+  $CONFIG_FILE
+EOF
+}
+
+parse_args() {
+  URLS=(); LISTS=(); MODE=""; TITLE=""; SEASON_OPT=""; START_OPT=""
+  OUTPUT_OVERRIDE=""; OVERWRITE=0; DRY_RUN=0; NO_PROGRESS=0; OPEN_SETTINGS=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -m|--movie)  MODE=movie;;
+      -s|--series) MODE=series;;
+      -n|--name)       [ $# -ge 2 ] || die "$1 needs a value"; TITLE=$2; shift;;
+      -S|--season)     [ $# -ge 2 ] || die "$1 needs a value"; is_uint "$2" || die "season must be a number"; SEASON_OPT=$2; shift;;
+      -e|--start)      [ $# -ge 2 ] || die "$1 needs a value"; is_uint "$2" || die "start must be a number"; START_OPT=$2; shift;;
+      -f|--file)       [ $# -ge 2 ] || die "$1 needs a value"; LISTS+=("$2"); shift;;
+      -q|--max-height) [ $# -ge 2 ] || die "$1 needs a value"; set_setting MAX_HEIGHT "$2" || exit 1; shift;;
+      -a|--audio)      [ $# -ge 2 ] || die "$1 needs a value"; set_setting AUDIO "$2" || exit 1; shift;;
+      -j|--jobs)       [ $# -ge 2 ] || die "$1 needs a value"; set_setting JOBS "$2" || exit 1; shift;;
+      -r|--retries)    [ $# -ge 2 ] || die "$1 needs a value"; set_setting RETRIES "$2" || exit 1; shift;;
+      -o|--output)     [ $# -ge 2 ] || die "$1 needs a value"; OUTPUT_OVERRIDE=$(expand_tilde "$2"); shift;;
+      --overwrite)   OVERWRITE=1;;
+      --dry-run)     DRY_RUN=1;;
+      --no-progress) NO_PROGRESS=1;;
+      --settings)    OPEN_SETTINGS=1;;
+      -h|--help)     usage; exit 0;;
+      -V|--version)  echo "bingedl $VERSION"; exit 0;;
+      --)            shift; while [ $# -gt 0 ]; do URLS+=("$1"); shift; done; break;;
+      -*)            die "unknown option: $1 (see --help)";;
+      *)             URLS+=("$1");;
+    esac
+    shift
+  done
+}
+
+cli_run() {
+  local u f
+  if [ -z "$MODE" ]; then
+    if [ -n "$SEASON_OPT$START_OPT" ] || [ "${#LISTS[@]}" -gt 0 ] || [ "${#URLS[@]}" -gt 1 ]; then
+      MODE=series
+    else
+      MODE=movie
+    fi
+  fi
+  if [ -z "$TITLE" ]; then
+    if [ -t 0 ]; then read -r -p "Title: " TITLE; TITLE=$(trim "$TITLE"); fi
+    [ -n "$TITLE" ] || die "a title is required (--name)"
+  fi
+  Q_SEASON=${SEASON_OPT:-1}; Q_EP=${START_OPT:-1}
+  : >"$QUEUE"
+  for u in "${URLS[@]}"; do add_link "$u"; done
+  for f in "${LISTS[@]}"; do read_listfile "$f"; done
+  [ -s "$QUEUE" ] || die "no valid links given"
+  if [ "$MODE" = movie ] && [ "$(wc -l <"$QUEUE" | tr -d ' ')" -ne 1 ]; then
+    die "movie mode takes exactly one link"
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then show_plan; return 0; fi
+  start_run
+}
+
+cleanup() {
+  local p f
+  trap - INT TERM EXIT
+  for p in $(jobs -p 2>/dev/null); do pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; done
+  if [ -n "${WORK:-}" ] && [ -f "$WORK/parts" ]; then
+    while IFS= read -r f; do [ -n "$f" ] && rm -f "$f"; done <"$WORK/parts"
+  fi
+  [ -n "${WORK:-}" ] && rm -rf "$WORK"
+  return 0
+}
+
+main() {
+  init_colors; set_defaults; load_config
+  parse_args "$@"
+  WORK=$(mktemp -d "${TMPDIR:-/tmp}/bingedl.XXXXXX") || die "cannot create a temp dir"
+  QUEUE="$WORK/queue"; RC=0; NJ=1; SHOW_BAR=0; STATUS=""
+  trap 'echo; echo "Interrupted."; cleanup; exit 130' INT TERM
+  trap cleanup EXIT
+
+  if [ "$OPEN_SETTINGS" -eq 1 ]; then settings_menu; return 0; fi
+  if [ "${#URLS[@]}" -eq 0 ] && [ "${#LISTS[@]}" -eq 0 ]; then
+    [ -t 0 ] || die "no links given (see --help)"
+    case $MODE in
+      movie)  interactive_movie;;
+      series) interactive_series;;
+      *)      interactive;;
+    esac
+    return 0
+  fi
+  cli_run
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+  exit "${RC:-0}"
+fi

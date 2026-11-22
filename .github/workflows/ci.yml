@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Install shellcheck (macOS)
+        if: runner.os == 'macOS'
+        # /bin first so tests run on the stock bash 3.2, not Homebrew's bash
+        run: brew install shellcheck && echo /bin >>"$GITHUB_PATH"
+      - name: Get ffmpeg and ffprobe
+        run: |
+          scripts/fetch-ffmpeg.sh "$RUNNER_TEMP/ffbin"
+          echo "$RUNNER_TEMP/ffbin" >>"$GITHUB_PATH"
+      - name: Bash version
+        run: bash --version | head -1
+      - name: shellcheck
+        run: shellcheck -x bingedl tests/*.sh scripts/*.sh
+      - name: selftest
+        run: bash tests/selftest.sh
+      - name: e2e
+        run: bash tests/e2e.sh
